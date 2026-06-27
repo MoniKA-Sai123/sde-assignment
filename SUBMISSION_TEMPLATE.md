@@ -1,132 +1,282 @@
 # Post-Call Processing Pipeline — Design Document
 
-**Author:** [Your Name]
-**Date:** [Date]
+**Author:** S N Monika
+**Date:** 27 June 2026
 
 ---
 
-## 1. Assumptions
+# 1. Assumptions
 
-_State every assumption you made about the business, system, or environment. Be specific. These will be discussed in the follow-up._
+The following assumptions were made while designing the solution:
 
-1. ...
-2. ...
+1. The platform processes approximately 100,000 completed calls during peak campaign periods.
+2. Each interaction belongs to exactly one customer and one campaign.
+3. The LLM provider enforces both request-per-minute (RPM) and token-per-minute (TPM) limits.
+4. Customers may have different subscription plans, resulting in different processing priorities.
+5. High-value outcomes (for example, successful sales or callback requests) require immediate processing, while low-priority interactions can be deferred.
+6. Call recordings may not be immediately available after a call ends.
+7. Temporary infrastructure failures (Redis, worker restart, network issues) should not result in permanent data loss.
 
 ---
 
-## 2. Problem Diagnosis
+# 2. Problem Diagnosis
 
-_Before designing anything: what is actually broken, and why does it break at scale? In your own words._
+The current implementation works for small workloads but fails during high-volume campaign runs.
+
+The major issues are:
+
+* Every completed call immediately triggers an LLM request without considering API limits.
+* A fixed `asyncio.sleep(45)` assumes recordings become available after exactly 45 seconds, causing missed recordings when delays occur.
+* Redis is used as the task broker, so worker failures or Redis restarts may cause task loss.
+* The circuit breaker completely pauses outbound processing instead of reducing processing gradually.
+* Limited logging makes production debugging difficult.
+
+The root problem is the absence of rate-limit-aware scheduling and durable processing.
 
 ---
 
-## 3. Architecture Overview
-
-_End-to-end flow from call-end webhook to completed analysis. Include a diagram._
+# 3. Architecture Overview
 
 ```
-[Your architecture diagram — ASCII or Mermaid]
+Call End Webhook
+        │
+        ▼
+Persist Interaction
+        │
+        ▼
+Priority Queue
+        │
+        ▼
+Rate Limit Scheduler
+        │
+ ┌──────┴─────────┐
+ │                │
+ ▼                ▼
+Urgent Queue   Deferred Queue
+ │                │
+ └──────┬─────────┘
+        ▼
+Recording Poller
+        ▼
+LLM Processing
+        ▼
+CRM Update
+        ▼
+Audit Logging
+        ▼
+Completed
 ```
 
-### Key design decisions
+### Key Design Decisions
 
-1. ...
-2. ...
-
----
-
-## 4. Rate Limit Management
-
-_This is the primary problem. How does your system respect LLM rate limits across 100K calls?_
-
-### How you track rate limit usage
-
-### How you decide what to process now vs. defer
-
-### What happens when the limit is hit (recovery, not crash)
+1. Introduced a centralized rate-limit-aware scheduler before every LLM request.
+2. Added per-customer token budgeting to prevent one customer from consuming all available capacity.
+3. Replaced the fixed recording delay with retry polling using exponential backoff.
+4. Added structured audit logging for complete interaction traceability.
 
 ---
 
-## 5. Per-Customer Token Budgeting
+# 4. Rate Limit Management
 
-_If total capacity is N tokens/min and K customers are active simultaneously:_
+The scheduler maintains the available request-per-minute and token-per-minute budget.
 
-- How do you allocate capacity across customers?
-- What guarantees does a customer with a pre-allocated budget receive?
-- What happens when a customer exceeds their budget?
-- What happens to unallocated headroom?
+Before sending an LLM request, it checks:
 
----
+* Remaining requests
+* Remaining token budget
+* Customer allocation
+* Request priority
 
-## 6. Differentiated Processing
+If sufficient capacity exists, the request is processed immediately.
 
-_Some call outcomes are time-sensitive. Some can wait. How do you determine which is which?_
+Otherwise, the request remains queued until capacity becomes available.
 
-_What mechanism do you use — is it a classification step, a flag set by the business, something else? Justify your choice._
-
----
-
-## 7. Recording Pipeline
-
-_Replacement for `asyncio.sleep(45s)`. How does it work? What does a failure look like to the on-call engineer?_
+This prevents API rate-limit errors and avoids unnecessary retries.
 
 ---
 
-## 8. Reliability & Durability
+# 5. Per-Customer Token Budgeting
 
-_How do you ensure no analysis result is permanently lost?_
+Each customer receives a configurable token allocation.
+
+Example:
+
+* Customer A → 40%
+* Customer B → 30%
+* Customer C → 20%
+* Shared Pool → 10%
+
+Customers always receive their reserved allocation.
+
+If unused capacity exists, it can temporarily be borrowed by other customers.
+
+Once the original customer becomes active again, its reserved capacity is restored.
 
 ---
 
-## 9. Auditability & Observability
+# 6. Differentiated Processing
 
-_How would you debug a specific failed interaction 3 days after the fact?_
+Interactions are divided into two categories.
 
-### What you log (and what fields every log event includes)
+**Immediate Processing**
 
-### Alert conditions
+* Successful sales
+* Callback requests
+* Escalations
+* High-value customers
+
+**Deferred Processing**
+
+* No answer
+* Spam
+* Short conversations
+* Low-priority interactions
+
+Urgent interactions receive higher scheduling priority while deferred work is processed whenever capacity becomes available.
 
 ---
 
-## 10. Data Model
+# 7. Recording Pipeline
 
-_Schema changes required. Show the SQL._
+Instead of waiting a fixed 45 seconds, the recording service continuously polls for recording availability.
+
+Retry intervals increase using exponential backoff.
+
+Example:
+
+* Retry after 5 seconds
+* Retry after 10 seconds
+* Retry after 20 seconds
+* Retry after 40 seconds
+
+If the recording still cannot be retrieved, a structured error event is generated and the interaction is marked for manual investigation.
+
+---
+
+# 8. Reliability & Durability
+
+Processing state is stored persistently.
+
+Each interaction moves through defined states:
+
+* Pending
+* Processing
+* Completed
+* Failed
+* Retrying
+
+Workers can safely resume unfinished work after failures.
+
+Every failed operation remains visible until successfully completed or manually resolved.
+
+---
+
+# 9. Auditability & Observability
+
+Each interaction receives a unique correlation ID.
+
+Every processing stage generates a structured log entry.
+
+### Logged Fields
+
+* interaction_id
+* customer_id
+* campaign_id
+* processing_stage
+* timestamp
+* retry_count
+* worker_id
+* status
+* error_message
+
+### Alert Conditions
+
+* Recording unavailable after maximum retries
+* Rate-limit utilization above 90%
+* Excessive processing queue length
+* Consecutive worker failures
+* CRM synchronization failures
+
+---
+
+# 10. Data Model
 
 ```sql
--- Your schema additions/changes here
+CREATE TABLE interaction_processing (
+    interaction_id UUID PRIMARY KEY,
+    customer_id UUID NOT NULL,
+    campaign_id UUID NOT NULL,
+    priority VARCHAR(20),
+    status VARCHAR(30),
+    retry_count INT DEFAULT 0,
+    estimated_tokens INT,
+    created_at TIMESTAMP,
+    updated_at TIMESTAMP
+);
+
+CREATE TABLE audit_logs (
+    id SERIAL PRIMARY KEY,
+    interaction_id UUID,
+    event_type VARCHAR(100),
+    event_time TIMESTAMP,
+    details JSONB
+);
 ```
 
 ---
 
-## 11. Security
+# 11. Security
 
-_What data in this system is sensitive? How do you protect it at rest and in transit?_
+Sensitive information includes:
 
----
+* Customer information
+* Phone numbers
+* Call recordings
+* Conversation transcripts
+* CRM data
 
-## 12. API Interface
+Protection measures:
 
-_Did you change the API contract (`POST /session/.../end`)? If yes, explain why. If no, explain why you kept it._
-
----
-
-## 13. Trade-offs & Alternatives Considered
-
-| Option | Why Considered | Why Rejected / What You Chose Instead |
-|--------|---------------|--------------------------------------|
-| ... | ... | ... |
-
----
-
-## 14. Known Weaknesses
-
-_What are the gaps in your design? What would you address next?_
+* HTTPS for all communication
+* Encryption at rest
+* Role-based access control
+* Limited log exposure for sensitive information
+* Secure credential management using environment variables
 
 ---
 
-## 15. What I Would Do With More Time
+# 12. API Interface
 
-_Specific, prioritised list — not a generic wishlist._
+The existing `POST /session/{sid}/interaction/{iid}/end` endpoint is retained.
 
-1. ...
-2. ...
+Keeping the existing API avoids breaking existing telephony integrations while allowing internal processing improvements without affecting external clients.
+
+---
+
+# 13. Trade-offs & Alternatives Considered
+
+| Option                     | Why Considered        | Why Rejected / What Was Chosen     |
+| -------------------------- | --------------------- | ---------------------------------- |
+| Immediate LLM execution    | Simple implementation | Causes API rate-limit failures     |
+| Fixed recording delay      | Easy implementation   | Misses delayed recordings          |
+| Binary circuit breaker     | Protects LLM          | Stops all processing unnecessarily |
+| Rate-limit-aware scheduler | Prevents overload     | Selected as the preferred approach |
+
+---
+
+# 14. Known Weaknesses
+
+* Token estimation may not perfectly match actual LLM usage.
+* Very large customer spikes may temporarily increase processing delay.
+* Scheduler introduces additional implementation complexity.
+* Advanced customer prioritization policies could be further improved.
+
+---
+
+# 15. What I Would Do With More Time
+
+1. Implement adaptive scheduling based on historical traffic patterns.
+2. Add automatic worker scaling during campaign peaks.
+3. Build dashboards for queue health and rate-limit monitoring.
+4. Add configurable customer priority policies through an admin interface.
+5. Improve retry strategies for CRM integrations and external services.
